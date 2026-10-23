@@ -35,9 +35,20 @@ class ErrorCode(str, enum.Enum):
 class ToolError:
     """A safe error value to return from tool handlers."""
 
-    def __init__(self, code: ErrorCode, detail: str | None = None):
+    def __init__(
+        self,
+        code: ErrorCode,
+        detail: str | None = None,
+        invalid_fields: list[str] | None = None,
+    ):
         self.code = code
         self.detail = detail
+        if invalid_fields is not None:
+            self.invalid_fields = invalid_fields
+        elif detail and detail.endswith(" is invalid"):
+            self.invalid_fields = [detail.removesuffix(" is invalid")]
+        else:
+            self.invalid_fields = []
 
     @property
     def message(self) -> str:
