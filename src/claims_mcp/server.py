@@ -12,15 +12,19 @@ Exposes five read-only tools with defense-in-depth security:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import time
 import uuid
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import Any
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from starlette.responses import Response
 
 from claims_mcp import queries
 from claims_mcp.audit import AuditLogger, AuditWriteError
@@ -28,6 +32,7 @@ from claims_mcp.config import ServerConfig
 from claims_mcp.db import open_readonly
 from claims_mcp.models import VALIDATORS, ToolError
 from claims_mcp.security import (
+    KeyEntry,
     KeyStore,
     RateLimiter,
     check_tool_allowed,
@@ -40,6 +45,72 @@ READ_ONLY_ANNOTATIONS = ToolAnnotations(
     read_only_hint=True,
     destructive_hint=False,
 )
+
+_current_caller: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_caller", default="stdio-local"
+)
+_current_key_entry: contextvars.ContextVar[KeyEntry | None] = contextvars.ContextVar(
+    "current_key_entry", default=None
+)
+_current_transport: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_transport", default="stdio"
+)
+
+
+@contextmanager
+def bound_caller(
+    caller: str,
+    key_entry: KeyEntry | None = None,
+    transport: str = "stdio",
+) -> Generator[None, None, None]:
+    """Context manager to bind caller and key entry to current context."""
+    tc = _current_caller.set(caller)
+    tk = _current_key_entry.set(key_entry)
+    tt = _current_transport.set(transport)
+    try:
+        yield
+    finally:
+        _current_caller.reset(tc)
+        _current_key_entry.reset(tk)
+        _current_transport.reset(tt)
+
+
+class BearerAuthMiddleware:
+    """ASGI middleware enforcing Bearer-key authentication (SPEC S4, D8)."""
+
+    def __init__(self, app: Any, key_store: KeyStore) -> None:
+        self.app = app
+        self.key_store = key_store
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        auth_raw = headers.get(b"authorization", b"").decode("utf-8")
+
+        if not auth_raw.startswith("Bearer "):
+            response = Response(b"", status_code=401)
+            await response(scope, receive, send)
+            return
+
+        raw_key = auth_raw[7:].strip()
+        key_entry = self.key_store.verify(raw_key)
+        if key_entry is None:
+            response = Response(b"", status_code=401)
+            await response(scope, receive, send)
+            return
+
+        tc = _current_caller.set(key_entry.key_id)
+        tk = _current_key_entry.set(key_entry)
+        tt = _current_transport.set("http")
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _current_caller.reset(tc)
+            _current_key_entry.reset(tk)
+            _current_transport.reset(tt)
 
 
 class ClaimsMCPServer(MCPServer):
@@ -61,6 +132,13 @@ class ClaimsMCPServer(MCPServer):
             max_calls=config.rate_limit_per_min
         )
         self.audit_logger = audit_logger or AuditLogger(config.audit_path)
+
+    def streamable_http_app(self, *args: Any, **kwargs: Any) -> Any:
+        """Create Starlette app wrapped with BearerAuthMiddleware if keys exist."""
+        app = super().streamable_http_app(*args, **kwargs)
+        if self.key_store is not None:
+            app = BearerAuthMiddleware(app, self.key_store)
+        return app
 
     async def call_tool(
         self,
@@ -84,8 +162,11 @@ class ClaimsMCPServer(MCPServer):
         request_id = uuid.uuid4().hex[:16]
 
         # 1. Authenticate (Caller / Token)
-        # For HTTP, caller/token may be passed in or set on request state
-        # In stdio mode, caller is 'stdio-local' and transport is 'stdio'
+        if caller == "stdio-local" and _current_caller.get() != "stdio-local":
+            caller = _current_caller.get()
+        if transport == "stdio" and _current_transport.get() != "stdio":
+            transport = _current_transport.get()
+        key_entry = getattr(context, "key_entry", None) or _current_key_entry.get()
 
         # 2. Rate limit check (S6)
         if not self.rate_limiter.check(caller):
@@ -110,9 +191,7 @@ class ClaimsMCPServer(MCPServer):
             )
 
         # 3. Tool Authorization check (S5)
-        # If a key_entry is present for the caller, verify tool allowlist
         if self.key_store is not None and caller != "stdio-local":
-            key_entry = getattr(context, "key_entry", None)
             if key_entry is not None and not check_tool_allowed(key_entry, name):
                 duration_ms = (time.perf_counter() - start_time) * 1000
                 try:
@@ -135,7 +214,6 @@ class ClaimsMCPServer(MCPServer):
         # 4. Input validation (SPEC 7 / models.py)
         validator = VALIDATORS.get(name)
         if validator is None:
-            # Unknown tool
             return CallToolResult(
                 is_error=True,
                 content=[TextContent(type="text", text="NOT_FOUND")],
@@ -160,7 +238,8 @@ class ClaimsMCPServer(MCPServer):
                     is_error=True,
                     content=[
                         TextContent(
-                            type="text", text=f"INTERNAL: reference {request_id}"
+                            type="text",
+                            text=f"INTERNAL: reference {request_id}",
                         )
                     ],
                 )
@@ -258,7 +337,8 @@ class ClaimsMCPServer(MCPServer):
                     is_error=True,
                     content=[
                         TextContent(
-                            type="text", text=f"INTERNAL: reference {request_id}"
+                            type="text",
+                            text=f"INTERNAL: reference {request_id}",
                         )
                     ],
                 )
